@@ -419,6 +419,35 @@ pub fn user_names() -> &'static HashMap<String, String> {
     })
 }
 
+/// Remember a name the user typed in: append `designation = name` to their
+/// names file (the first one that exists, else a new one at `$XISF2PNG_NAMES`
+/// if set, else in the per-user config folder) so the next run finds it.
+/// Returns the file written.
+pub fn save_user_name(designation: &str, name: &str) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+
+    let paths = user_names_paths();
+    let path = paths
+        .iter()
+        .find(|p| p.is_file())
+        .or(std::env::var_os("XISF2PNG_NAMES").and(paths.first()))
+        .or(paths.last())
+        .ok_or_else(|| std::io::Error::other("no location for the names file"))?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    // Keep the entry on a line of its own even if the file lacks a final
+    // newline; `#` would start a comment, so it cannot be part of a name.
+    let lead = match std::fs::read_to_string(path) {
+        Ok(text) if !text.is_empty() && !text.ends_with('\n') => "\n",
+        _ => "",
+    };
+    let name = name.replace('#', "");
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(file, "{lead}{designation} = {}", name.trim())?;
+    Ok(path.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

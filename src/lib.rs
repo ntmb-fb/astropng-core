@@ -15,7 +15,8 @@ pub mod post;
 pub mod wcs;
 pub mod xisf;
 
-pub use batch::{collect_files, run, FileStatus, Options, Progress, Summary};
+pub use batch::{collect_files, run, run_asking, FileStatus, Options, Progress, Summary};
+pub use lookup::AskName;
 pub use post::{Label, Stamper};
 
 /// Crate version, for `--version` and window titles.

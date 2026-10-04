@@ -1,6 +1,6 @@
 [package]
 name = "astropng-core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Shared core for the AstroPNG family: XISF/FITS -> PNG conversion, stretch, resize, stamp, and SIMBAD catalogue lookup, exposed as a Rust crate and a C ABI for other-language ports"
 

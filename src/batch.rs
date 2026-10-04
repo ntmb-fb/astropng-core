@@ -10,7 +10,7 @@ use std::sync::{mpsc, Mutex};
 use image::{DynamicImage, GrayImage, ImageFormat, RgbImage};
 
 use crate::fits;
-use crate::lookup::{self, Resolver};
+use crate::lookup::{self, AskName, Resolver};
 use crate::pixels;
 use crate::post::{Label, Stamper};
 use crate::xisf;
@@ -148,6 +148,20 @@ pub fn run(
     cancel: &AtomicBool,
     report: &mut dyn FnMut(&Progress),
 ) -> Result<Summary, String> {
+    run_asking(opts, cancel, None, report)
+}
+
+/// [`run`], but when an identified object has no nickname, `ask` is called
+/// (from a worker thread, one call at a time) with its designation and type
+/// so the user can supply one. Returning `None` leaves the object without a
+/// nickname; each object is asked about once per run, and names given are
+/// saved to the user's names file.
+pub fn run_asking(
+    opts: &Options,
+    cancel: &AtomicBool,
+    ask: Option<&AskName<'_>>,
+    report: &mut dyn FnMut(&Progress),
+) -> Result<Summary, String> {
     let explicit = !opts.files.is_empty();
     if !explicit && !opts.input_dir.is_dir() {
         return Err(format!(
@@ -210,7 +224,7 @@ pub fn run(
     // shared cache across workers (a run of 300 subs of one target still costs
     // one or two SIMBAD requests). The heavy work - decode, stretch, resize,
     // stamp, encode - runs in parallel.
-    let resolver = Mutex::new(Resolver::new(opts.lookup && stamper.is_some()));
+    let resolver = Mutex::new(Resolver::new(opts.lookup && stamper.is_some()).asking(ask));
     let stamper = stamper.as_ref();
     let workers = worker_count(opts.concurrency, jobs.len());
     let next = AtomicUsize::new(0);
@@ -264,9 +278,15 @@ pub fn run(
         summary.cancelled = true;
     }
 
-    if let Some(e) = resolver.into_inner().unwrap().failure {
+    let resolver = resolver.into_inner().unwrap();
+    if let Some(e) = resolver.failure {
         summary.warnings.push(format!(
             "Online object lookup unavailable ({e}); file names were stamped instead."
+        ));
+    }
+    if let Some(e) = resolver.save_failure {
+        summary.warnings.push(format!(
+            "Could not save nicknames to the names file ({e}); they were used for this run only."
         ));
     }
 
@@ -286,7 +306,7 @@ fn process_one(
     dest: &Path,
     opts: &Options,
     stamper: Option<&Stamper>,
-    resolver: &Mutex<Resolver>,
+    resolver: &Mutex<Resolver<'_>>,
 ) -> Result<Outcome, String> {
     // A PNG source is only ever resized/stamped, never "converted".
     let is_png = has_ext(src, &["png"]);

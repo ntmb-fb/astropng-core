@@ -238,9 +238,14 @@ impl ObjectInfo {
     }
 }
 
+/// Asked for a nickname when an identified object has none: gets the object's
+/// designation ("NGC 2403") and its type in plain words ("Spiral galaxy"),
+/// returns the name to stamp, or `None` to go without one.
+pub type AskName<'a> = dyn Fn(&str, &str) -> Option<String> + Sync + 'a;
+
 /// Resolves names online, caching every answer for the duration of a run so
 /// a folder of 300 subs of the same target costs one request.
-pub struct Resolver {
+pub struct Resolver<'a> {
     enabled: bool,
     agent: Option<ureq::Agent>,
     cache: HashMap<String, Option<ObjectInfo>>,
@@ -248,9 +253,16 @@ pub struct Resolver {
     nearby_cache: HashMap<String, Option<ObjectInfo>>,
     /// Set (and lookups disabled) after the first network failure.
     pub failure: Option<String>,
+    /// Who to ask for a nickname when an object has none.
+    ask: Option<&'a AskName<'a>>,
+    /// What they answered, by object, so each is asked about once per run.
+    asked: HashMap<String, Option<String>>,
+    /// Set when a nickname the user gave could not be saved to their names
+    /// file (it is still stamped for this run).
+    pub save_failure: Option<String>,
 }
 
-impl Resolver {
+impl<'a> Resolver<'a> {
     pub fn new(enabled: bool) -> Self {
         let agent = enabled.then(|| {
             ureq::Agent::config_builder()
@@ -268,7 +280,49 @@ impl Resolver {
             cache: HashMap::new(),
             nearby_cache: HashMap::new(),
             failure: None,
+            ask: None,
+            asked: HashMap::new(),
+            save_failure: None,
         }
+    }
+
+    /// Ask `ask` for a nickname whenever an object about to be stamped has
+    /// none. Names given are saved to the user's names file.
+    pub fn asking(mut self, ask: Option<&'a AskName<'a>>) -> Self {
+        self.ask = ask;
+        self
+    }
+
+    /// `info`, with a nickname from the user if it had none and they gave
+    /// one. `preferred` is the designation the title will show.
+    fn named(&mut self, info: &ObjectInfo, preferred: Option<&str>) -> ObjectInfo {
+        let mut info = info.clone();
+        let Some(ask) = self.ask else { return info };
+        if info.common_name.is_some() {
+            return info;
+        }
+        let key = normalize(&info.main_id);
+        if !self.asked.contains_key(&key) {
+            let answer = ask(&title_designation(&info, preferred), &info.type_description())
+                .map(|name| collapse_ws(&name))
+                .filter(|name| !name.is_empty());
+            if let Some(name) = &answer {
+                // File it under a catalogue id, which is what the names file
+                // is matched against on the next run.
+                let designation = title_designation(&info, None);
+                if let Err(e) = crate::catalog::save_user_name(&designation, name) {
+                    self.save_failure = Some(e.to_string());
+                }
+            }
+            self.asked.insert(key.clone(), answer);
+        }
+        info.common_name = self.asked[&key].clone();
+        info
+    }
+
+    /// The label for `info`, asking for a nickname first if it has none.
+    fn label(&mut self, info: &ObjectInfo, preferred: Option<&str>) -> Label {
+        compose(&self.named(info, preferred), preferred)
     }
 
     /// The most prominent deep-sky object within `radius_deg` of a position,
@@ -786,7 +840,7 @@ struct Named {
 /// any), the header coordinates (plate solution or mount target, if any) and
 /// the file name stem.
 pub fn identify(
-    resolver: &mut Resolver,
+    resolver: &mut Resolver<'_>,
     header_object: Option<&str>,
     coords: Option<SkyCoords>,
     stem: &str,
@@ -816,7 +870,7 @@ pub fn identify(
             Some(named) => {
                 let (Some(ra), Some(dec)) = (named.info.ra_deg, named.info.dec_deg) else {
                     return Identification {
-                        label: compose(&named.info, named.preferred.as_deref()),
+                        label: resolver.label(&named.info, named.preferred.as_deref()),
                         note: named.note,
                     };
                 };
@@ -848,9 +902,9 @@ pub fn identify(
                                 }
                                 return Identification {
                                     label: compose_pair(
-                                        &named.info,
+                                        &resolver.named(&named.info, named.preferred.as_deref()),
                                         named.preferred.as_deref(),
-                                        &centre,
+                                        &resolver.named(&centre, None),
                                         &c,
                                     ),
                                     note: Some(note),
@@ -859,7 +913,7 @@ pub fn identify(
                         }
                     }
                     return Identification {
-                        label: compose(&named.info, named.preferred.as_deref()),
+                        label: resolver.label(&named.info, named.preferred.as_deref()),
                         note: named.note,
                     };
                 }
@@ -875,7 +929,7 @@ pub fn identify(
                     resolver.adopt_companion_nebula(&mut actual);
                     if !actual.same_object(&named.info) && actual.is_notable() {
                         return Identification {
-                            label: compose(&actual, None),
+                            label: resolver.label(&actual, None),
                             note: Some(format!(
                                 "{what} is {sep:.1}° from the {where_from}; the frame is centred on {}, used that",
                                 actual_title(&actual)
@@ -891,7 +945,7 @@ pub fn identify(
                     note = format!("{n}; {note}");
                 }
                 return Identification {
-                    label: compose(&named.info, named.preferred.as_deref()),
+                    label: resolver.label(&named.info, named.preferred.as_deref()),
                     note: Some(note),
                 };
             }
@@ -900,7 +954,7 @@ pub fn identify(
                     resolver.adopt_companion_nebula(&mut actual);
                     let where_from = if c.solved { "plate solution" } else { "header coordinates" };
                     return Identification {
-                        label: compose(&actual, None),
+                        label: resolver.label(&actual, None),
                         note: Some(format!("identified from the {where_from}")),
                     };
                 }
@@ -908,7 +962,7 @@ pub fn identify(
         }
     } else if let Some(named) = named {
         return Identification {
-            label: compose(&named.info, named.preferred.as_deref()),
+            label: resolver.label(&named.info, named.preferred.as_deref()),
             note: named.note,
         };
     }
@@ -923,7 +977,7 @@ pub fn identify(
 
 /// Header OBJECT first, cross-checked against the file name; then the file
 /// name alone.
-fn identify_by_name(resolver: &mut Resolver, header: Option<&str>, file_desig: Option<&str>) -> Option<Named> {
+fn identify_by_name(resolver: &mut Resolver<'_>, header: Option<&str>, file_desig: Option<&str>) -> Option<Named> {
     if let Some(h) = header {
         if let Some(info) = resolver.resolve(h).cloned() {
             return Some(match file_desig {
@@ -1457,6 +1511,50 @@ mod tests {
         assert!(!is_clean_name("Rosette B"));
         assert!(!is_clean_name("Lo 2"));
         assert!(!is_clean_name("NIPSS 1548C27 IRS 1"));
+    }
+
+    #[test]
+    fn asks_for_missing_nickname_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let file = std::env::temp_dir().join(format!("astropng-names-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        std::env::set_var("XISF2PNG_NAMES", &file);
+
+        let calls = AtomicUsize::new(0);
+        let ask = |designation: &str, kind: &str| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(kind, "Open cluster");
+            (designation == "NGC 9001").then(|| "  My   Cluster ".to_string())
+        };
+        let object = |id: &str, name: Option<&str>| {
+            let mut aliases = vec![id.to_string()];
+            aliases.extend(name.map(|n| format!("NAME {n}")));
+            ObjectInfo::from_aliases(id.to_string(), aliases, "OpC".into(), None, None, None)
+        };
+        let mut r = Resolver::new(false).asking(Some(&ask));
+
+        // Nameless: asked once, the answer is reused and saved.
+        let nameless = object("NGC 9001", None);
+        assert_eq!(r.label(&nameless, None).title, "My Cluster (NGC 9001)");
+        assert_eq!(r.label(&nameless, None).title, "My Cluster (NGC 9001)");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "NGC 9001 = My Cluster\n");
+
+        // Declined: no name, not asked again, nothing saved.
+        let declined = object("NGC 9002", None);
+        assert_eq!(r.label(&declined, None).title, "NGC 9002");
+        assert_eq!(r.label(&declined, None).title, "NGC 9002");
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+        // Already named: never asked.
+        let known = object("NGC 9003", Some("Test Cluster"));
+        assert_eq!(r.label(&known, None).title, "Test Cluster (NGC 9003)");
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert!(r.save_failure.is_none());
+
+        std::env::remove_var("XISF2PNG_NAMES");
+        let _ = std::fs::remove_file(&file);
     }
 
     /// Talks to SIMBAD. Run with: cargo test --lib live_simbad -- --ignored --nocapture
