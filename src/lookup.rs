@@ -325,6 +325,37 @@ impl<'a> Resolver<'a> {
         compose(&self.named(info, preferred), preferred)
     }
 
+    /// When the online services could not identify the frame but the file
+    /// name or header still names an object, ask for a nickname for that
+    /// designation (when the lookup was meant to run and asking is enabled)
+    /// and return what to stamp. `None` leaves the plain file-name fallback.
+    fn fallback_named(&mut self, file_desig: Option<&str>, header: Option<&str>) -> Option<Identification> {
+        if !self.enabled || self.ask.is_none() {
+            return None;
+        }
+        let designation = file_desig.or(header).map(str::to_string)?;
+        let info = ObjectInfo::from_aliases(
+            designation.clone(),
+            vec![designation.clone()],
+            String::new(),
+            None,
+            None,
+            None,
+        );
+        let named = self.named(&info, Some(&designation));
+        let note = match (&self.failure, &named.common_name) {
+            // The network going away is reported by the summary warning,
+            // not per file.
+            (Some(_), _) => None,
+            (None, Some(_)) => Some("object not found in SIMBAD; nickname applied".into()),
+            (None, None) => Some("object not found in SIMBAD; used file name".into()),
+        };
+        Some(Identification {
+            label: compose(&named, Some(&designation)),
+            note,
+        })
+    }
+
     /// The most prominent deep-sky object within `radius_deg` of a position,
     /// or `None` if there is nothing with a recognised catalogue id or a
     /// common name there.
@@ -849,15 +880,22 @@ pub fn identify(
         label: Label::plain(stem),
         note: None,
     };
-    if !resolver.enabled() {
-        return fallback();
-    }
 
     let file_desig = designation_in_name(stem);
     let header = header_object
         .map(str::trim)
         .map(|s| s.trim_matches('\'').trim())
         .filter(|s| !s.is_empty());
+
+    // Lookup disabled (or it already failed): when the file name or header
+    // still names an object, ask for a nickname for that designation before
+    // stamping the bare file name.
+    if !resolver.enabled() {
+        if let Some(id) = resolver.fallback_named(file_desig.as_deref(), header) {
+            return id;
+        }
+        return fallback();
+    }
 
     let mut named = identify_by_name(resolver, header, file_desig.as_deref());
     if let Some(n) = named.as_mut() {
@@ -967,7 +1005,11 @@ pub fn identify(
         };
     }
 
-    // Nothing resolved (or the network went away).
+    // Nothing resolved (or the network went away): ask for a nickname for
+    // the designation the file name or header names, then fall back to it.
+    if let Some(id) = resolver.fallback_named(file_desig.as_deref(), header) {
+        return id;
+    }
     let mut id = fallback();
     if resolver.enabled() && (header.is_some() || file_desig.is_some()) {
         id.note = Some("object not found in SIMBAD; used file name".into());
@@ -1331,6 +1373,10 @@ fn otype_description(code: &str) -> &str {
 mod tests {
     use super::*;
 
+    /// The two tests that read and write the user names file touch the same
+    /// `XISF2PNG_NAMES` environment variable; keep them from racing.
+    static NAMES_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn designations_from_names() {
         assert_eq!(designation_in_name("M31_Andromeda_2026-09-05"), Some("M 31".into()));
@@ -1517,6 +1563,7 @@ mod tests {
     fn asks_for_missing_nickname_once() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
+        let _names = NAMES_LOCK.lock().unwrap();
         let file = std::env::temp_dir().join(format!("astropng-names-{}.txt", std::process::id()));
         let _ = std::fs::remove_file(&file);
         std::env::set_var("XISF2PNG_NAMES", &file);
@@ -1552,6 +1599,66 @@ mod tests {
         assert_eq!(r.label(&known, None).title, "Test Cluster (NGC 9003)");
         assert_eq!(calls.load(Ordering::Relaxed), 2);
         assert!(r.save_failure.is_none());
+
+        std::env::remove_var("XISF2PNG_NAMES");
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// When the online lookup cannot identify the frame (object not in
+    /// SIMBAD, or the service is down) but the file name or header names an
+    /// object, that designation is still worth a nickname question.
+    #[test]
+    fn asks_for_nickname_when_lookup_cannot_identify() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _names = NAMES_LOCK.lock().unwrap();
+        let file = std::env::temp_dir().join(format!("astropng-names-fallback-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        std::env::set_var("XISF2PNG_NAMES", &file);
+
+        // Lookup requested, service down (as after a timeout): the file
+        // name's designation is asked about, the answer stamped and saved.
+        let calls = AtomicUsize::new(0);
+        let ask = |designation: &str, kind: &str| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            assert_eq!((designation, kind), ("NGC 772", ""));
+            (designation == "NGC 772").then(|| "  Cloud   Nine ".to_string())
+        };
+        let mut r = Resolver::new(true).asking(Some(&ask));
+        r.failure = Some("Sesame request failed: timeout: global".into());
+        let id = identify(&mut r, None, None, "Light_NGC_772_0001");
+        assert_eq!(id.label.title, "Cloud Nine (NGC 772)");
+        assert_eq!(id.note, None);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "NGC 772 = Cloud Nine\n");
+
+        // Asked once per designation, however many files fall back.
+        identify(&mut r, None, None, "Light_NGC_772_0002");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        // Declined: the designation is stamped, not asked again.
+        let mut r2 = Resolver::new(true).asking(Some(&|_, _| None));
+        r2.failure = Some("Sesame request failed: timeout: global".into());
+        let id = identify(&mut r2, None, None, "Light_NGC_772_0001");
+        assert_eq!(id.label.title, "NGC 772");
+        assert_eq!(id.note, None);
+
+        // The header's OBJECT keyword works when the file name has none.
+        let mut r3 = Resolver::new(true).asking(Some(&|_, _| None));
+        r3.failure = Some("Sesame request failed: timeout: global".into());
+        let id = identify(&mut r3, Some("NGC 772"), None, "stack_0001");
+        assert_eq!(id.label.title, "NGC 772");
+
+        // Lookup never requested (offline mode): never asked.
+        let mut r4 = Resolver::new(false).asking(Some(&|_, _| panic!("must not ask")));
+        let id = identify(&mut r4, None, None, "Light_NGC_772_0001");
+        assert_eq!(id.label.title, "Light_NGC_772_0001");
+
+        // No asking hook: plain file name, as before.
+        let mut r5 = Resolver::new(true);
+        r5.failure = Some("Sesame request failed: timeout: global".into());
+        let id = identify(&mut r5, None, None, "Light_NGC_772_0001");
+        assert_eq!(id.label.title, "Light_NGC_772_0001");
 
         std::env::remove_var("XISF2PNG_NAMES");
         let _ = std::fs::remove_file(&file);
