@@ -14,7 +14,7 @@ name: Purge green run logs
 
 on:
   workflow_run:
-    workflows: ["CI", "Notify consumers of new version"]
+    workflows: ["CI", "Notify consumers of new version", "Delete merged branches"]
     types: [completed]
   workflow_dispatch:
 
